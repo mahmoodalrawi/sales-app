@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 st.set_page_config(page_title="محلل مبيعات المنظفات", layout="wide")
@@ -88,6 +89,78 @@ def seasonality(df, by="product"):
     return idx
 
 
+def season_idx(d):
+    m = d.groupby(d["date"].dt.to_period("M"))["quantity"].sum().reset_index()
+    m["mo"] = m["date"].dt.month
+    a = m.groupby("mo")["quantity"].mean().reindex(range(1, 13))
+    a = a.fillna(a.mean())
+    return (a / a.mean()).values
+
+
+def simulate(base, season, start, p, reps, price_pct, promo_pct, runs=40, seed=1):
+    """محاكاة مخزون وطلب لمدة 12 شهرًا (مخزون + طلب عشوائي + تأخر التوريد)."""
+    rng = np.random.default_rng(seed)
+    L, cover = int(p["lead"]), p["cover"]
+    cov = (reps / p["reps_now"]) ** 0.5            # أثر زيادة المندوبين (عوائد متناقصة)
+    pf = (1 + price_pct / 100) ** p["elast"]        # أثر تغيير السعر على الطلب
+    price = p["price0"] * (1 + price_pct / 100)
+    cost = p["price0"] * p["cost_pct"] / 100
+    units = np.zeros((runs, 12)); profit = np.zeros((runs, 12)); lost = np.zeros(runs)
+    for r in range(runs):
+        stock = cover * base * season[start % 12]
+        pipe = [0.0] * L
+        for t in range(12):
+            m = (start + t) % 12
+            if L:
+                stock += pipe.pop(0)
+            promo = 1 + promo_pct / 100 if season[m] >= 1.2 else 1.0
+            d = base * season[m] * cov * pf * promo * rng.lognormal(0, p["vol"])
+            sold = min(d, stock)
+            stock -= sold
+            lost[r] += d - sold
+            fc = base * season[(m + L) % 12] * cov * pf
+            order = max(0.0, cover * fc - stock - sum(pipe))
+            if L:
+                pipe.append(order)
+            else:
+                stock += order
+            units[r, t] = sold
+            promo_cost = (promo_pct / 100) * 0.3 * sold * price if promo > 1 else 0
+            profit[r, t] = (sold * (price - cost) - stock * cost * p["hold"] / 100
+                            - promo_cost - reps * p["rep_cost"])
+    return units, profit, lost
+
+
+COORD = {"بغداد": (33.3152, 44.3661), "نينوى": (36.3350, 43.1189), "البصرة": (30.5085, 47.7804),
+         "ذي قار": (31.0439, 46.2576), "بابل": (32.4637, 44.4196), "السليمانية": (35.5558, 45.4351),
+         "أربيل": (36.1911, 44.0092), "الأنبار": (33.4258, 43.2993), "النجف": (32.0000, 44.3362),
+         "ديالى": (33.7500, 44.6333), "كركوك": (35.4681, 44.3922), "صلاح الدين": (34.6071, 43.6782),
+         "واسط": (32.5128, 45.8182), "دهوك": (36.8679, 42.9885), "القادسية": (31.9889, 44.9249),
+         "كربلاء": (32.6160, 44.0249), "ميسان": (31.8350, 47.1440), "المثنى": (31.3090, 45.2806)}
+
+
+def km(a, b):
+    la1, lo1, la2, lo2 = map(np.radians, (*a, *b))
+    h = np.sin((la2 - la1) / 2) ** 2 + np.cos(la1) * np.cos(la2) * np.sin((lo2 - lo1) / 2) ** 2
+    return 6371 * 2 * np.arcsin(np.sqrt(h))
+
+
+def fleet_plan(t, hub, p):
+    """يحسب المندوبين والسيارات لكل محافظة. t: governorate, pop_m, ppi"""
+    t = t.copy()
+    t["shops"] = t["pop_m"] * 1000 * p["shops_k"]
+    visits = t["shops"] * p["cover"] / 100 * p["visits"]
+    t["reps"] = np.maximum(np.ceil(visits / (p["per_day"] * p["days"])), 1).astype(int)
+    t["volume"] = p["target_pc"] * t["pop_m"] * 1e6 * t["ppi"]
+    t["dist_km"] = [km(COORD[hub], COORD[g]) * 1.3 for g in t["governorate"]]
+    days_trip = np.ceil(1 + 2 * t["dist_km"] / p["km_day"])
+    trips = p["days"] / days_trip
+    t["vehicles"] = np.maximum(np.ceil(t["volume"] / (p["cap"] * trips)), 1).astype(int)
+    t["cost"] = t["reps"] * p["rep_cost"] + t["vehicles"] * p["veh_cost"]
+    t["cost_per_unit"] = t["cost"] / t["volume"].replace(0, np.nan)
+    return t
+
+
 st.title("محلل مبيعات المنظفات")
 
 with st.expander("إعدادات البيانات والتصفية", expanded=True):
@@ -138,7 +211,7 @@ c1.metric("إجمالي المبيعات", f"{view['revenue'].sum():,.0f}")
 c2.metric("عدد الأصناف", view["product"].nunique())
 c3.metric("عدد المحافظات", view["governorate"].nunique())
 
-tab1, tab2 = st.tabs(["تأثير المواسم على الأصناف", "تنشيط مبيعات المحافظات"])
+tab1, tab2, tab3, tab4 = st.tabs(["تأثير المواسم على الأصناف", "تنشيط مبيعات المحافظات", "محاكاة السيناريوهات", "الخريطة والتوزيع"])
 
 with tab1:
     st.caption("المؤشر 1.0 = المعدل الطبيعي. أعلى من 1.2 موسم ذروة، وأقل من 0.8 موسم ركود.")
@@ -168,3 +241,104 @@ with tab2:
     st.plotly_chart(fig2, use_container_width=True)
     st.subheader("ترتيب الأولوية")
     st.dataframe(g.round(0), hide_index=True, use_container_width=True)
+
+with tab3:
+    st.caption("محاكاة 12 شهرًا بمخزون وطلب عشوائي وتأخر توريد، وتقارن وضعك الحالي بسيناريو جديد. "
+               "تعتمد على موسمية بياناتك ومتوسط مبيعاتها للمحافظة المختارة.")
+    season = season_idx(view)
+    n_months = max(view["date"].dt.to_period("M").nunique(), 1)
+    base = view["quantity"].sum() / n_months
+    price0 = view["revenue"].sum() / max(view["quantity"].sum(), 1)
+    start = st.selectbox("شهر البداية", range(12), index=int(view["date"].max().month) % 12,
+                         format_func=lambda i: MONTHS[i])
+    st.markdown("**الوضع الحالي**")
+    reps_now = st.number_input("عدد المندوبين الحالي", 1, 500, 20)
+    st.markdown("**السيناريو الجديد**")
+    reps = st.slider("عدد المندوبين", 1, 500, int(reps_now))
+    price_pct = st.slider("تغيير السعر %", -20, 20, 0)
+    promo_pct = st.slider("عرض ترويجي في مواسم الذروة (زيادة طلب %)", 0, 50, 0)
+    with st.expander("إعدادات النموذج"):
+        lead = st.slider("مدة التوريد (أشهر)", 0, 3, 1)
+        cover = st.slider("مخزون الأمان (أشهر تغطية)", 0.5, 3.0, 1.0, 0.1)
+        elast = st.slider("مرونة الطلب للسعر", -3.0, -0.2, -1.2, 0.1)
+        cost_pct = st.slider("تكلفة المنتج % من السعر", 30, 95, 70)
+        vol = st.slider("تذبذب الطلب", 0.0, 0.5, 0.10, 0.05)
+        hold = st.slider("تكلفة التخزين الشهرية % من قيمة المخزون", 0.0, 10.0, 2.0, 0.5)
+        rep_cost = st.number_input("كلفة المندوب الشهرية (دينار)", 0, 10_000_000, 1_000_000, 100_000)
+    p = dict(lead=lead, cover=cover, reps_now=reps_now, elast=elast, price0=price0,
+             cost_pct=cost_pct, vol=vol, hold=hold, rep_cost=rep_cost)
+    ua, pa, la = simulate(base, season, start, p, reps_now, 0, 0)
+    ub, pb, lb = simulate(base, season, start, p, reps, price_pct, promo_pct)
+
+    k1, k2, k3 = st.columns(3)
+    k1.metric("الربح السنوي (السيناريو)", f"{pb.sum(1).mean():,.0f}",
+              f"{pb.sum(1).mean() - pa.sum(1).mean():,.0f}")
+    k2.metric("الوحدات المباعة", f"{ub.sum(1).mean():,.0f}",
+              f"{ub.sum(1).mean() - ua.sum(1).mean():,.0f}")
+    k3.metric("طلب ضائع بسبب النفاد", f"{lb.mean():,.0f}", f"{lb.mean() - la.mean():,.0f}", delta_color="inverse")
+
+    labels = [MONTHS[(start + t) % 12] for t in range(12)]
+    fig = go.Figure()
+    for name, u, col in (("الحالي", ua, "#888"), ("السيناريو", ub, "#e8553d")):
+        lo, mid, hi = np.percentile(u, [10, 50, 90], axis=0)
+        fig.add_trace(go.Scatter(x=labels + labels[::-1], y=list(hi) + list(lo[::-1]), fill="toself",
+                                 fillcolor=col, opacity=0.2, line=dict(width=0), showlegend=False))
+        fig.add_trace(go.Scatter(x=labels, y=mid, name=name, line=dict(color=col, width=3)))
+    fig.update_layout(title="المبيعات الشهرية المتوقعة (الوحدات)", margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab4:
+    st.caption("خريطة المحافظات مع السكان، وحساب المندوبين والسيارات المطلوبة. القيم الافتراضية افتراضات "
+               "يجب استبدالها بأرقامك الفعلية.")
+    hub = st.selectbox("موقع المخزن الرئيسي", list(COORD), index=0)
+    with st.expander("افتراضات التوزيع", expanded=False):
+        shops_k = st.slider("عدد المتاجر لكل 1000 نسمة", 0.5, 8.0, 3.0, 0.5)
+        cover = st.slider("نسبة تغطية المتاجر المستهدفة %", 10, 100, 60)
+        visits = st.slider("زيارات المتجر الواحد في الشهر", 1, 8, 2)
+        per_day = st.slider("زيارات المندوب في اليوم", 5, 40, 15)
+        days = st.slider("أيام العمل في الشهر", 18, 28, 24)
+        cap = st.number_input("حمولة السيارة (وحدات في الرحلة)", 100, 20000, 2000, 100)
+        km_day = st.number_input("مسافة السيارة في اليوم (كم)", 100, 800, 400, 50)
+        rep_cost = st.number_input("كلفة المندوب الشهرية (دينار)", 0, 10_000_000, 1_000_000, 100_000, key="rc4")
+        veh_cost = st.number_input("كلفة السيارة الشهرية (دينار)", 0, 20_000_000, 3_000_000, 250_000)
+
+    n_m = max(df["date"].dt.to_period("M").nunique(), 1)
+    gu = df.groupby("governorate")["quantity"].sum() / n_m
+    pops = pd.Series(POP)
+    pc = (gu / pops.reindex(gu.index)).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(pc):
+        pc_default = float(pc.quantile(0.75))
+    else:
+        pc_default = float(gu.sum() / (sum(POP.values()) * 1e6))
+    target_pc = st.number_input("هدف المبيعات للفرد شهريًا (وحدات)", 0.0, 1000.0, round(pc_default, 3), 0.01,
+                                help="الافتراضي: مبيعات الفرد في أفضل 25% من محافظاتك")
+
+    st.markdown("**السكان والقدرة الشرائية** (1.0 = المتوسط، أعلى = قدرة شرائية أكبر، عدّلها من مسح الدخل الرسمي)")
+    t0 = pd.DataFrame({"governorate": list(COORD)})
+    t0["pop_m"] = t0["governorate"].map(POP)
+    t0["ppi"] = 1.0
+    t0 = st.data_editor(t0, disabled=["governorate"], hide_index=True, use_container_width=True, key="fleet_ed")
+    p4 = dict(shops_k=shops_k, cover=cover, visits=visits, per_day=per_day, days=days, target_pc=target_pc,
+              km_day=km_day, cap=cap, rep_cost=rep_cost, veh_cost=veh_cost)
+    plan = fleet_plan(t0, hub, p4)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("إجمالي المندوبين", f"{plan['reps'].sum():,}")
+    m2.metric("إجمالي السيارات", f"{plan['vehicles'].sum():,}")
+    m3.metric("الكلفة الشهرية", f"{plan['cost'].sum():,.0f}")
+
+    plan["lat"] = plan["governorate"].map(lambda g: COORD[g][0])
+    plan["lon"] = plan["governorate"].map(lambda g: COORD[g][1])
+    kw = dict(lat="lat", lon="lon", size="pop_m", color="ppi", hover_name="governorate",
+              hover_data={"pop_m": True, "reps": True, "vehicles": True, "lat": False, "lon": False},
+              size_max=45, zoom=4.8, height=480, color_continuous_scale="YlOrRd")
+    if hasattr(px, "scatter_map"):
+        fmap = px.scatter_map(plan, map_style="open-street-map", **kw)
+    else:
+        fmap = px.scatter_mapbox(plan, mapbox_style="open-street-map", **kw)
+    fmap.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+    st.plotly_chart(fmap, use_container_width=True)
+
+    st.subheader("خطة التوزيع لكل محافظة")
+    show = plan[["governorate", "pop_m", "ppi", "shops", "reps", "volume", "dist_km", "vehicles", "cost_per_unit"]]
+    st.dataframe(show.sort_values("volume", ascending=False).round(2), hide_index=True, use_container_width=True)
