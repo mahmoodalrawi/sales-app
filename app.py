@@ -62,6 +62,7 @@ GUESS = {
     "product": ["product", "item", "المنتج", "منتج", "الصنف", "صنف", "المادة"],
     "quantity": ["quantity", "qty", "الكمية", "كمية"],
     "price": ["price", "السعر", "سعر"],
+    "customer": ["customer", "partner", "client", "العميل", "الزبون", "عميل", "زبون"],
     "total": ["total", "subtotal", "amount", "revenue", "الإجمالي", "الاجمالي", "المجموع", "المبلغ"],
 }
 
@@ -333,6 +334,112 @@ def abm_fig(res, i):
     return fig
 
 
+def alloc(w, total):
+    """توزيع المندوبين بنسبة الأهداف مع حد أدنى 1."""
+    raw = np.asarray(w) / np.sum(w) * total
+    r = np.floor(raw).astype(int)
+    for i in np.argsort(-(raw - r))[: total - r.sum()]:
+        r[i] += 1
+    if total >= len(r):
+        while (r == 0).any():
+            r[np.argmax(r)] -= 1
+            r[np.argmin(r)] += 1
+    return r
+
+
+def manager_report(d, growth=10, reps_total=20):
+    d = d.copy()
+    d["ym"] = d["date"].dt.to_period("M")
+    last = d["ym"].max()
+    if 1 < d["date"].max().day < 25:
+        last -= 1
+    d = d[d["ym"] <= last]
+    months = sorted(d["ym"].unique())
+    if len(months) < 4:
+        return None
+    cur_m, prev_m, base_m = months[-1], months[-2], months[-4:-1]
+    nxt = cur_m + 1
+    nm = MONTHS[nxt.month - 1]
+    acts = []
+
+    def pivot(col):
+        return d.pivot_table(index=col, columns="ym", values="revenue", aggfunc="sum", fill_value=0)
+
+    def moves(col):
+        p = pivot(col)
+        base = p[base_m].mean(axis=1).replace(0, np.nan)
+        return (p[cur_m] / base - 1).dropna()
+
+    for g, c in moves("governorate").items():
+        if c < -0.15:
+            acts.append(("عاجل" if c < -0.25 else "مهم", f"انخفضت مبيعات {g} {abs(c):.0%}",
+                         "راجع أكبر تجار المنطقة هذا الأسبوع وتأكد من التوريد والأسعار ونشاط المنافسين", abs(c)))
+        elif c > 0.25:
+            acts.append(("فرصة", f"نمت مبيعات {g} +{c:.0%}", "ادعم الزخم بزيادة المخزون وزيارات المندوبين", c * 0.5))
+    for g, c in moves("product").items():
+        if c < -0.2:
+            acts.append(("مهم", f"تراجع صنف {g} {abs(c):.0%}", "راجع السعر والعرض وتوفر الصنف عند التجار", abs(c) * 0.8))
+
+    sp = seasonality(d, "product")
+    if nm in sp.columns:
+        for p_, v in sp[nm][sp[nm] > 1.2].sort_values(ascending=False).head(3).items():
+            acts.append(("مهم", f"خزّن {p_} قبل {nm}", f"الطلب المتوقع {v:.0%} من المعدل، اطلب من المورد الآن", v - 0.5))
+
+    pops = pd.Series(POP)
+    rev12 = d[d["ym"] > last - 12].groupby("governorate")["revenue"].sum()
+    rev12 = rev12[rev12.index.isin(pops.index)]
+    if len(rev12) >= 4:
+        pc = rev12 / (pops[rev12.index] * 1e6)
+        tgt = pc.quantile(0.75)
+        ratio = (rev12 / (tgt * pops[rev12.index] * 1e6)).sort_values()
+        for g, r_ in ratio.head(3).items():
+            if r_ < 0.8:
+                acts.append(("فرصة", f"فجوة في {g}", f"مبيعات الفرد {r_:.0%} من الهدف، أضف مندوبًا أو موزعًا", 0.9 - r_))
+
+    tot_g = pivot("governorate")[cur_m]
+    if tot_g.sum() > 0 and tot_g.max() / tot_g.sum() > 0.4:
+        acts.append(("مهم", f"تركّز المبيعات في {tot_g.idxmax()} ({tot_g.max() / tot_g.sum():.0%})",
+                     "وسّع في المحافظات الأخرى لتقليل المخاطرة", 0.3))
+
+    # الأهداف
+    sidx = season_idx(d)
+    gh = pivot("governorate")
+    base_avg = gh[base_m].mean(axis=1)
+    sf = sidx[nxt.month - 1] / np.mean([sidx[m.month - 1] for m in base_m])
+    tgt_df = pd.DataFrame({"المتوقع": base_avg * sf})
+    tgt_df["الهدف"] = tgt_df["المتوقع"] * (1 + growth / 100)
+    tgt_df["المندوبون"] = alloc(tgt_df["الهدف"].clip(lower=1).values, int(reps_total))
+    tgt_df["هدف المندوب"] = tgt_df["الهدف"] / tgt_df["المندوبون"].replace(0, np.nan)
+    tgt_df = tgt_df.sort_values("الهدف", ascending=False).round(0).reset_index().rename(columns={"governorate": "المحافظة"})
+
+    risk = None
+    if "customer" in d.columns:
+        ref = d["date"].max()
+        g_ = d.groupby("customer")
+        c = pd.DataFrame({"آخر طلب": g_["date"].max(), "عدد الطلبات": g_["date"].nunique(), "إجمالي": g_["revenue"].sum()})
+        c["الفترة المعتادة (يوم)"] = g_["date"].apply(lambda s: s.drop_duplicates().sort_values().diff().dt.days.median())
+        c["مضى (يوم)"] = (ref - c["آخر طلب"]).dt.days
+        risk = c[(c["عدد الطلبات"] >= 3) & (c["الفترة المعتادة (يوم)"] > 0) &
+                 (c["مضى (يوم)"] > 1.5 * c["الفترة المعتادة (يوم)"])].sort_values("إجمالي", ascending=False).head(15).reset_index()
+        if len(risk):
+            acts.append(("عاجل", f"{len(risk)} عميلًا تأخروا عن موعد طلبهم المعتاد",
+                         f"زرهم أو اتصل بهم هذا الأسبوع، قيمتهم {risk['إجمالي'].sum():,.0f}", 0.95))
+
+    order = {"عاجل": 0, "مهم": 1, "فرصة": 2}
+    acts.sort(key=lambda a: (order[a[0]], -a[3]))
+    tot_cur = d[d["ym"] == cur_m]["revenue"].sum()
+    tot_prev = d[d["ym"] == prev_m]["revenue"].sum()
+    yoy = None
+    if (cur_m - 12) in months:
+        yoy = tot_cur / max(d[d["ym"] == cur_m - 12]["revenue"].sum(), 1e-9) - 1
+    lines = [f"تقرير مدير المبيعات - آخر شهر: {cur_m}", f"مبيعات الشهر: {tot_cur:,.0f} ({tot_cur / max(tot_prev, 1e-9) - 1:+.0%} عن الشهر السابق)", "", "قرارات هذا الأسبوع:"]
+    lines += [f"{i}. [{a[0]}] {a[1]} - {a[2]}" for i, a in enumerate(acts[:8], 1)]
+    lines += ["", f"أهداف {nm} (نمو {growth}%):"]
+    lines += [f"- {r['المحافظة']}: {r['الهدف']:,.0f} ({int(r['المندوبون'])} مندوب)" for _, r in tgt_df.head(8).iterrows()]
+    return dict(acts=acts, targets=tgt_df, risk=risk, tot=tot_cur, mom=tot_cur / max(tot_prev, 1e-9) - 1, yoy=yoy,
+                next=nm, cur=str(cur_m), text="\n".join(lines))
+
+
 st.title("محلل مبيعات المنظفات")
 
 with st.expander("إعدادات البيانات والتصفية", expanded=True):
@@ -352,6 +459,7 @@ with st.expander("إعدادات البيانات والتصفية", expanded=Tr
         c_gov = pick("عمود المحافظة", "governorate")
         c_prod = pick("عمود الصنف", "product")
         c_qty = pick("عمود الكمية", "quantity")
+        c_cust = pick("عمود العميل (اختياري، لتنبيهات العملاء المتوقفين)", "customer")
         c_total = pick("عمود إجمالي المبلغ (إن وجد)", "total")
         c_price = pick("عمود سعر الوحدة (إن لم يوجد الإجمالي)", "price")
         if "—" in (c_date, c_gov, c_prod, c_qty) or (c_total == "—" and c_price == "—"):
@@ -365,7 +473,10 @@ with st.expander("إعدادات البيانات والتصفية", expanded=Tr
             "product": raw[c_prod].astype(str).str.strip(),
             "quantity": qty,
             "revenue": rev,
-        }).dropna()
+        })
+        if c_cust != "—":
+            df["customer"] = raw[c_cust].astype(str).str.strip()
+        df = df.dropna()
         if df.empty:
             st.error("لا توجد صفوف صالحة، تأكد من رقم صف العناوين ومن الأعمدة المختارة.")
             st.stop()
@@ -383,7 +494,7 @@ c1.metric("إجمالي المبيعات", f"{view['revenue'].sum():,.0f}")
 c2.metric("عدد الأصناف", view["product"].nunique())
 c3.metric("عدد المحافظات", view["governorate"].nunique())
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["تأثير المواسم على الأصناف", "تنشيط مبيعات المحافظات", "محاكاة السيناريوهات", "الخريطة والتوزيع", "محاكاة التوزيع (وكلاء)"])
+tab6, tab1, tab2, tab3, tab4, tab5 = st.tabs(["مدير المبيعات", "تأثير المواسم على الأصناف", "تنشيط مبيعات المحافظات", "محاكاة السيناريوهات", "الخريطة والتوزيع", "محاكاة التوزيع (وكلاء)"])
 
 with tab1:
     st.caption("المؤشر 1.0 = المعدل الطبيعي. أعلى من 1.2 موسم ذروة، وأقل من 0.8 موسم ركود.")
@@ -667,3 +778,33 @@ with tab5:
         st.bar_chart(res["daily"].set_index("day")["stockout"])
         st.markdown("**سجل التجارب** (غيّر الإعدادات وأعد التشغيل للمقارنة)")
         st.dataframe(pd.DataFrame(st.session_state["abm_hist"]), hide_index=True, use_container_width=True)
+
+
+with tab6:
+    st.caption("يحلل بياناتك كمدير مبيعات: ماذا تغيّر، أين الخطر والفرصة، وما المطلوب هذا الأسبوع، مع أهداف الشهر القادم.")
+    g6, r6 = st.columns(2)
+    growth6 = g6.slider("نمو مستهدف %", 0, 40, 10, key="g6")
+    reps6 = r6.number_input("عدد المندوبين", 1, 500, 20, key="reps6")
+    rep = manager_report(df, growth6, int(reps6))
+    if rep is None:
+        st.warning("المدير يحتاج بيانات 4 أشهر على الأقل.")
+    else:
+        m1, m2 = st.columns(2)
+        m1.metric(f"مبيعات {rep['cur']}", f"{rep['tot']:,.0f}", f"{rep['mom']:+.0%} عن السابق")
+        if rep["yoy"] is not None:
+            m2.metric("عن نفس الشهر السنة الماضية", f"{rep['yoy']:+.0%}")
+        st.subheader("قرارات هذا الأسبوع")
+        icons = {"عاجل": "🔴", "مهم": "🟠", "فرصة": "🟢"}
+        if not rep["acts"]:
+            st.success("لا توجد تنبيهات حرجة، الأداء ضمن المعتاد.")
+        for a in rep["acts"][:12]:
+            st.markdown(f"{icons[a[0]]} **{a[1]}**  \n{a[2]}")
+        st.subheader("أهداف " + rep["next"])
+        st.dataframe(rep["targets"], hide_index=True, use_container_width=True)
+        if rep["risk"] is not None and len(rep["risk"]):
+            st.subheader("عملاء يحتاجون زيارة")
+            st.dataframe(rep["risk"], hide_index=True, use_container_width=True)
+        elif rep["risk"] is None:
+            st.info("لتنبيهات العملاء المتوقفين، اختر عمود العميل عند رفع ملفك.")
+        st.text_area("تقرير جاهز للنسخ", rep["text"], height=260)
+        st.download_button("تحميل التقرير", rep["text"].encode("utf-8-sig"), file_name="sales_manager_report.txt")
