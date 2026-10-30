@@ -4,7 +4,7 @@ import plotly.express as px
 import streamlit as st
 
 st.set_page_config(page_title="محلل مبيعات المنظفات", layout="wide")
-st.markdown("<style>.stApp{direction:rtl;text-align:right}</style>", unsafe_allow_html=True)
+st.markdown("<style>[data-testid=\"stMain\"]{direction:rtl;text-align:right}</style>", unsafe_allow_html=True)
 
 MONTHS = ["كانون الثاني", "شباط", "آذار", "نيسان", "أيار", "حزيران", "تموز",
           "آب", "أيلول", "تشرين الأول", "تشرين الثاني", "كانون الأول"]
@@ -70,8 +70,7 @@ def seasonality(df, by="product"):
 
 st.title("محلل مبيعات المنظفات")
 
-with st.sidebar:
-    st.header("البيانات")
+with st.expander("إعدادات البيانات والتصفية", expanded=False):
     up = st.file_uploader("ارفع ملف المبيعات (CSV أو Excel)", type=["csv", "xlsx"])
     st.caption("الأعمدة: date, governorate, product, quantity, price")
     df = load(up) if up else make_sample()
