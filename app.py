@@ -305,12 +305,14 @@ with tab4:
     n_m = max(df["date"].dt.to_period("M").nunique(), 1)
     gu = df.groupby("governorate")["quantity"].sum() / n_m
     pops = pd.Series(POP)
-    pc = (gu / pops.reindex(gu.index)).replace([np.inf, -np.inf], np.nan).dropna()
+    pc = (gu / (pops.reindex(gu.index) * 1e6)).replace([np.inf, -np.inf], np.nan).dropna()
     if len(pc):
         pc_default = float(pc.quantile(0.75))
     else:
         pc_default = float(gu.sum() / (sum(POP.values()) * 1e6))
-    target_pc = st.number_input("هدف المبيعات للفرد شهريًا (وحدات)", 0.0, 1000.0, round(pc_default, 3), 0.01,
+    pc_default = float(pc_default) if np.isfinite(pc_default) and pc_default > 0 else 0.001
+    target_pc = st.number_input("هدف المبيعات للفرد شهريًا (وحدات)", min_value=0.0, value=round(pc_default, 5),
+                                step=0.001, format="%.5f",
                                 help="الافتراضي: مبيعات الفرد في أفضل 25% من محافظاتك")
 
     st.markdown("**السكان والقدرة الشرائية** (1.0 = المتوسط، أعلى = قدرة شرائية أكبر، عدّلها من مسح الدخل الرسمي)")
