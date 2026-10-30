@@ -53,9 +53,29 @@ def make_sample():
     return pd.DataFrame(rows, columns=["date", "governorate", "product", "quantity", "price"])
 
 
-def load(file):
-    df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
-    df["date"] = pd.to_datetime(df["date"])
+GUESS = {
+    "date": ["date", "التاريخ", "تاريخ"],
+    "governorate": ["governorate", "state", "province", "city", "المحافظة", "محافظة", "المنطقة", "المدينة"],
+    "product": ["product", "item", "المنتج", "منتج", "الصنف", "صنف", "المادة"],
+    "quantity": ["quantity", "qty", "الكمية", "كمية"],
+    "price": ["price", "السعر", "سعر"],
+    "total": ["total", "subtotal", "amount", "revenue", "الإجمالي", "الاجمالي", "المجموع", "المبلغ"],
+}
+
+
+def guess(cols, key):
+    for c in cols:
+        if any(k in str(c).lower() for k in GUESS[key]):
+            return str(c)
+    return None
+
+
+def read_raw(file, header):
+    if file.name.lower().endswith(".csv"):
+        df = pd.read_csv(file, header=header)
+    else:
+        df = pd.read_excel(file, header=header)
+    df.columns = [str(c) for c in df.columns]
     return df
 
 
@@ -70,14 +90,47 @@ def seasonality(df, by="product"):
 
 st.title("محلل مبيعات المنظفات")
 
-with st.expander("إعدادات البيانات والتصفية", expanded=False):
+with st.expander("إعدادات البيانات والتصفية", expanded=True):
     up = st.file_uploader("ارفع ملف المبيعات (CSV أو Excel)", type=["csv", "xlsx"])
-    st.caption("الأعمدة: date, governorate, product, quantity, price")
-    df = load(up) if up else make_sample()
-    st.info("تعرض الآن بيانات حقيقية" if up else "تعرض الآن بيانات تجريبية")
+    if up:
+        hdr = st.number_input("رقم صف العناوين في الملف", 1, 30, 1)
+        raw = read_raw(up, int(hdr) - 1)
+        st.caption("أول صفوف الملف:")
+        st.dataframe(raw.head(3), use_container_width=True)
+        cols = ["—"] + list(raw.columns)
+
+        def pick(label, key):
+            g = guess(raw.columns, key)
+            return st.selectbox(label, cols, index=cols.index(g) if g else 0)
+
+        c_date = pick("عمود التاريخ", "date")
+        c_gov = pick("عمود المحافظة", "governorate")
+        c_prod = pick("عمود الصنف", "product")
+        c_qty = pick("عمود الكمية", "quantity")
+        c_total = pick("عمود إجمالي المبلغ (إن وجد)", "total")
+        c_price = pick("عمود سعر الوحدة (إن لم يوجد الإجمالي)", "price")
+        if "—" in (c_date, c_gov, c_prod, c_qty) or (c_total == "—" and c_price == "—"):
+            st.warning("اختر الأعمدة المطلوبة: التاريخ، المحافظة، الصنف، الكمية، والمبلغ أو السعر.")
+            st.stop()
+        qty = pd.to_numeric(raw[c_qty], errors="coerce")
+        rev = pd.to_numeric(raw[c_total], errors="coerce") if c_total != "—" else qty * pd.to_numeric(raw[c_price], errors="coerce")
+        df = pd.DataFrame({
+            "date": pd.to_datetime(raw[c_date], errors="coerce"),
+            "governorate": raw[c_gov].astype(str).str.strip(),
+            "product": raw[c_prod].astype(str).str.strip(),
+            "quantity": qty,
+            "revenue": rev,
+        }).dropna()
+        if df.empty:
+            st.error("لا توجد صفوف صالحة، تأكد من رقم صف العناوين ومن الأعمدة المختارة.")
+            st.stop()
+        st.success(f"تم قراءة {len(df):,} صفًا من بياناتك")
+    else:
+        df = make_sample()
+        df["revenue"] = df["quantity"] * df["price"]
+        st.info("تعرض الآن بيانات تجريبية")
     gov_filter = st.selectbox("المحافظة", ["كل العراق"] + sorted(df["governorate"].unique()))
 
-df["revenue"] = df["quantity"] * df["price"]
 view = df if gov_filter == "كل العراق" else df[df["governorate"] == gov_filter]
 
 c1, c2, c3 = st.columns(3)
